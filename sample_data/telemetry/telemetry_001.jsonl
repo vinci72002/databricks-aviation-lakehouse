@@ -1,0 +1,2 @@
+{"event_id": "EVT-001", "aircraft_id": "AC-101", "flight_id": "FL-001", "event_time": "2026-10-01T10:00:00", "altitude_ft": 32000, "ground_speed_kts": 450, "engine_temp_c": 650.0, "fuel_remaining_kg": 5200.0}
+{"event_id": "EVT-002", "aircraft_id": "AC-101", "flight_id": "FL-001", "event_time": "2026-10-01T10:01:00", "altitude_ft": 32500, "ground_speed_kts": 455, "engine_temp_c": 655.0, "fuel_remaining_kg": 5150.0}

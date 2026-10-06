@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Databricks / Spark local artifacts
+.databricks/
+.databricks-login.json
+spark-warehouse/
+metastore_db/
+derby.log
+.ivy2/
+
+# Auto Loader state — never commit checkpoints or inferred schemas
+**/_checkpoints/
+**/_schemas/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
