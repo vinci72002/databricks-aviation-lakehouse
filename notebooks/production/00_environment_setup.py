@@ -1,17 +1,19 @@
 # Databricks notebook source
-# Databricks notebook source
 # ============================================================
-# DE-101 - Environment & Configuration
-# Aviation Lakehouse Production Simulation
+# 00 - Environment Setup
+# DE-101 / DE-103 - Aviation Lakehouse
 #
-# Purpose:
-#   1. Create isolated DEV / PROD environments
-#   2. Use the same code for both environments
-#   3. Parameterize catalog, tables, volumes and checkpoints
+# Responsibilities:
+#   1. Validate the environment parameter
+#   2. Resolve and validate environment-specific configuration
+#   3. Create catalog, schemas, volume and source directory
+#   4. Verify environment objects
 #
 # Environment mapping:
-#   env=dev  -> aviation_dev
-#   env=prod -> aviation_prod
+#   dev  -> aviation_dev
+#   prod -> aviation_prod
+#
+# This notebook does not initialize business tables.
 # ============================================================
 
 
@@ -26,261 +28,218 @@ ALLOWED_ENVS = {"dev", "prod"}
 
 if env not in ALLOWED_ENVS:
     raise ValueError(
-        f"Invalid environment: '{env}'. "
-        f"Allowed values: {sorted(ALLOWED_ENVS)}"
+        f"Invalid environment: {env!r}. " f"Allowed values: {sorted(ALLOWED_ENVS)}"
     )
-
-catalog = f"aviation_{env}"
-
-print("=" * 60)
-print("AVIATION LAKEHOUSE")
-print("=" * 60)
-print(f"Environment : {env.upper()}")
-print(f"Catalog     : {catalog}")
-print("=" * 60)
 
 
 # COMMAND ----------
-# 2. Environment definitions
+# 2. Resolve configuration
+#
+# Configuration is kept local for now so this notebook can run
+# independently. We will connect common/config.py when the
+# repository import and deployment structure is established.
 
-SCHEMAS = [
+catalog = f"aviation_{env}"
+
+SCHEMAS = (
     "raw",
     "bronze",
     "silver",
     "quarantine",
     "gold",
-    "ops"
-]
+    "ops",
+)
 
-print("Schemas:")
-for schema in SCHEMAS:
-    print(f"  {catalog}.{schema}")
+VOLUME_NAME = "landing"
+VOLUME_FULL_NAME = f"{catalog}.raw.{VOLUME_NAME}"
+
+RAW_VOLUME = f"/Volumes/{catalog}/raw/{VOLUME_NAME}"
+
+TELEMETRY_SOURCE_PATH = f"{RAW_VOLUME}/telemetry"
+TELEMETRY_SCHEMA_PATH = f"{RAW_VOLUME}/_schemas/telemetry"
+TELEMETRY_CHECKPOINT_PATH = f"{RAW_VOLUME}/_checkpoints/bronze_telemetry"
+
+BRONZE_TELEMETRY_TABLE = f"{catalog}.bronze.telemetry"
+
+SILVER_TELEMETRY_TABLE = f"{catalog}.silver.telemetry"
+SILVER_AIRCRAFT_TABLE = f"{catalog}.silver.aircraft"
+
+QUARANTINE_TELEMETRY_TABLE = f"{catalog}.quarantine.telemetry"
+
+GOLD_HOURLY_TABLE = f"{catalog}.gold.fact_telemetry_hourly"
+GOLD_DAILY_TABLE = f"{catalog}.gold.fact_telemetry_daily"
+DIM_AIRCRAFT_TABLE = f"{catalog}.gold.dim_aircraft"
+
+PIPELINE_AUDIT_TABLE = f"{catalog}.ops.pipeline_audit"
+PIPELINE_CONTROL_TABLE = f"{catalog}.ops.pipeline_control"
+
+STORAGE_PATHS = {
+    "raw_volume": RAW_VOLUME,
+    "telemetry_source": TELEMETRY_SOURCE_PATH,
+    "schema_location": TELEMETRY_SCHEMA_PATH,
+    "checkpoint_location": TELEMETRY_CHECKPOINT_PATH,
+}
+
+TABLE_NAMES = {
+    "bronze_telemetry": BRONZE_TELEMETRY_TABLE,
+    "silver_telemetry": SILVER_TELEMETRY_TABLE,
+    "silver_aircraft": SILVER_AIRCRAFT_TABLE,
+    "quarantine_telemetry": QUARANTINE_TELEMETRY_TABLE,
+    "gold_hourly": GOLD_HOURLY_TABLE,
+    "gold_daily": GOLD_DAILY_TABLE,
+    "dim_aircraft": DIM_AIRCRAFT_TABLE,
+    "pipeline_audit": PIPELINE_AUDIT_TABLE,
+    "pipeline_control": PIPELINE_CONTROL_TABLE,
+}
 
 
 # COMMAND ----------
-# 3. Create catalog
+# 3. Validate configuration before creating objects
 
-spark.sql(f"""
-CREATE CATALOG IF NOT EXISTS {catalog}
-""")
+expected_volume_root = f"/Volumes/{catalog}/raw/{VOLUME_NAME}"
+
+for name, path in STORAGE_PATHS.items():
+    if not (
+        path == expected_volume_root or path.startswith(f"{expected_volume_root}/")
+    ):
+        raise RuntimeError(
+            f"Environment isolation failed for {name}: {path}. "
+            f"Expected volume root: {expected_volume_root}"
+        )
+
+    if any(part in {".", ".."} for part in path.split("/")):
+        raise RuntimeError(f"Unexpected relative path component in {name}: {path}")
+
+for name, table in TABLE_NAMES.items():
+    parts = table.split(".")
+
+    if (
+        len(parts) != 3
+        or parts[0] != catalog
+        or parts[1] not in SCHEMAS
+        or not parts[2]
+    ):
+        raise RuntimeError(f"Invalid environment-specific table for {name}: {table}")
+
+if len(set(STORAGE_PATHS.values())) != len(STORAGE_PATHS):
+    raise RuntimeError("Storage paths must be distinct.")
+
+print("Configuration validation: PASSED")
+
+
+# COMMAND ----------
+# 4. Display resolved configuration
+#
+# Table names below are configuration values.
+# Their existence is not checked by this notebook.
+
+print("=" * 60)
+print("AVIATION LAKEHOUSE - ENVIRONMENT SETUP")
+print("=" * 60)
+print(f"Environment : {env.upper()}")
+print(f"Catalog     : {catalog}")
+print(f"Volume      : {VOLUME_FULL_NAME}")
+
+print("\nStorage paths:")
+for name, path in STORAGE_PATHS.items():
+    print(f"  {name:<24} = {path}")
+
+print("\nConfigured table names:")
+for name, table in TABLE_NAMES.items():
+    print(f"  {name:<24} = {table}")
+
+
+# COMMAND ----------
+# 5. Create catalog
+
+spark.sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`")
 
 print(f"Catalog ready: {catalog}")
 
 
 # COMMAND ----------
-# 4. Create schemas
+# 6. Create schemas
 
 for schema in SCHEMAS:
-
-    spark.sql(f"""
-    CREATE SCHEMA IF NOT EXISTS {catalog}.{schema}
-    """)
+    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
 
     print(f"Schema ready: {catalog}.{schema}")
 
 
 # COMMAND ----------
-# 5. Create landing volume
+# 7. Create managed landing volume
 #
-# In this free Production Lab the Unity Catalog Volume
-# simulates an external cloud landing zone such as ADLS Gen2.
+# Uses the managed storage configured in Unity Catalog.
 
 spark.sql(f"""
-CREATE VOLUME IF NOT EXISTS {catalog}.raw.landing
-""")
+    CREATE VOLUME IF NOT EXISTS
+        `{catalog}`.`raw`.`{VOLUME_NAME}`
+    """)
 
-print(f"Volume ready: {catalog}.raw.landing")
+print(f"Volume ready: {VOLUME_FULL_NAME}")
 
 
 # COMMAND ----------
-# 6. Standard storage paths
+# 8. Create source directory
 #
-# IMPORTANT:
-# DEV and PROD must never share:
-#   - source path
-#   - Auto Loader schemaLocation
-#   - checkpointLocation
+# Auto Loader manages its schema and checkpoint state.
+# Only the input directory is created here.
 
-RAW_VOLUME = f"/Volumes/{catalog}/raw/landing"
+created = dbutils.fs.mkdirs(TELEMETRY_SOURCE_PATH)
 
-TELEMETRY_SOURCE_PATH = (
-    f"{RAW_VOLUME}/telemetry"
-)
+if not created:
+    raise RuntimeError(
+        f"Could not create source directory: " f"{TELEMETRY_SOURCE_PATH}"
+    )
 
-TELEMETRY_SCHEMA_PATH = (
-    f"{RAW_VOLUME}/_schemas/telemetry"
-)
-
-TELEMETRY_CHECKPOINT_PATH = (
-    f"{RAW_VOLUME}/_checkpoints/bronze_telemetry"
-)
+print(f"Source directory ready: {TELEMETRY_SOURCE_PATH}")
 
 
 # COMMAND ----------
-# 7. Standard table names
+# 9. Verify schemas
 
-BRONZE_TELEMETRY_TABLE = (
-    f"{catalog}.bronze.telemetry"
-)
+schema_rows = spark.sql(f"SHOW SCHEMAS IN `{catalog}`").collect()
 
-SILVER_TELEMETRY_TABLE = (
-    f"{catalog}.silver.telemetry"
-)
+# SHOW SCHEMAS returns the schema name in its first column.
+actual_schemas = {str(row[0]) for row in schema_rows}
 
-SILVER_AIRCRAFT_TABLE = (
-    f"{catalog}.silver.aircraft"
-)
+missing_schemas = set(SCHEMAS) - actual_schemas
 
-QUARANTINE_TELEMETRY_TABLE = (
-    f"{catalog}.quarantine.telemetry"
-)
+if missing_schemas:
+    raise RuntimeError(
+        f"Environment setup failed. "
+        f"Missing schemas in {catalog}: "
+        f"{sorted(missing_schemas)}"
+    )
 
-GOLD_HOURLY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_hourly"
-)
-
-GOLD_DAILY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_daily"
-)
-
-DIM_AIRCRAFT_TABLE = (
-    f"{catalog}.gold.dim_aircraft"
-)
-
-PIPELINE_AUDIT_TABLE = (
-    f"{catalog}.ops.pipeline_audit"
-)
-
-# DE-102 will use this table for incremental processing.
-PIPELINE_CONTROL_TABLE = (
-    f"{catalog}.ops.pipeline_control"
-)
+print(f"Schema verification: PASSED ({len(SCHEMAS)} required)")
 
 
 # COMMAND ----------
-# 8. Display resolved configuration
+# 10. Verify landing volume
 
-print()
-print("=" * 60)
-print("RESOLVED ENVIRONMENT CONFIGURATION")
-print("=" * 60)
+volume_rows = spark.sql(f"SHOW VOLUMES IN `{catalog}`.`raw`").collect()
 
-print(f"""
-Environment
------------
-env                     = {env}
-catalog                 = {catalog}
+actual_volumes = {row["volume_name"] for row in volume_rows}
 
-Storage
--------
-raw_volume              = {RAW_VOLUME}
-telemetry_source        = {TELEMETRY_SOURCE_PATH}
-schema_location         = {TELEMETRY_SCHEMA_PATH}
-checkpoint_location     = {TELEMETRY_CHECKPOINT_PATH}
+if VOLUME_NAME not in actual_volumes:
+    raise RuntimeError(
+        f"Environment setup failed. " f"Missing volume: {VOLUME_FULL_NAME}"
+    )
 
-Bronze
-------
-bronze_telemetry        = {BRONZE_TELEMETRY_TABLE}
-
-Silver
-------
-silver_telemetry        = {SILVER_TELEMETRY_TABLE}
-silver_aircraft         = {SILVER_AIRCRAFT_TABLE}
-
-Quarantine
-----------
-quarantine_telemetry    = {QUARANTINE_TELEMETRY_TABLE}
-
-Gold
-----
-gold_hourly             = {GOLD_HOURLY_TABLE}
-gold_daily              = {GOLD_DAILY_TABLE}
-dim_aircraft            = {DIM_AIRCRAFT_TABLE}
-
-Operations
-----------
-pipeline_audit          = {PIPELINE_AUDIT_TABLE}
-pipeline_control        = {PIPELINE_CONTROL_TABLE}
-""")
+print("Volume verification: PASSED")
 
 
 # COMMAND ----------
-# 9. Safety validation
+# 11. Verify source directory access
 #
-# Prevent accidental cross-environment paths.
+# Listing an empty directory is valid.
+# Listing failure raises an exception and fails the task.
 
-expected_prefix = f"/Volumes/aviation_{env}/"
+source_entries = dbutils.fs.ls(TELEMETRY_SOURCE_PATH)
 
-paths_to_validate = [
-    RAW_VOLUME,
-    TELEMETRY_SOURCE_PATH,
-    TELEMETRY_SCHEMA_PATH,
-    TELEMETRY_CHECKPOINT_PATH
-]
-
-for path in paths_to_validate:
-
-    if not path.startswith(expected_prefix):
-
-        raise RuntimeError(
-            "Environment isolation validation failed.\n"
-            f"Environment : {env}\n"
-            f"Path        : {path}\n"
-            f"Expected    : {expected_prefix}"
-        )
-
-
-tables_to_validate = [
-    BRONZE_TELEMETRY_TABLE,
-    SILVER_TELEMETRY_TABLE,
-    SILVER_AIRCRAFT_TABLE,
-    QUARANTINE_TELEMETRY_TABLE,
-    GOLD_HOURLY_TABLE,
-    GOLD_DAILY_TABLE,
-    DIM_AIRCRAFT_TABLE,
-    PIPELINE_AUDIT_TABLE,
-    PIPELINE_CONTROL_TABLE
-]
-
-expected_catalog_prefix = f"aviation_{env}."
-
-for table in tables_to_validate:
-
-    if not table.startswith(expected_catalog_prefix):
-
-        raise RuntimeError(
-            "Environment isolation validation failed.\n"
-            f"Environment : {env}\n"
-            f"Table       : {table}\n"
-            f"Expected    : {expected_catalog_prefix}"
-        )
-
-print("Environment isolation validation: PASSED")
-
-
-# COMMAND ----------
-# 10. Validate catalog objects
-
-print()
-print("=" * 60)
-print("ENVIRONMENT OBJECTS")
-print("=" * 60)
-
-display(
-    spark.sql(
-        f"SHOW SCHEMAS IN {catalog}"
-    )
-)
-
-
-# COMMAND ----------
-# 11. Validate landing volume
-
-display(
-    spark.sql(
-        f"SHOW VOLUMES IN {catalog}.raw"
-    )
-)
+print("Source directory access: PASSED")
+print(f"Source directory entries: {len(source_entries)}")
 
 
 # COMMAND ----------
@@ -288,123 +247,25 @@ display(
 
 print()
 print("=" * 60)
-print("DE-101 ENVIRONMENT SETUP: SUCCESS")
+print("ENVIRONMENT SETUP: SUCCESS")
 print("=" * 60)
 
 print(f"""
-Active environment : {env.upper()}
-Active catalog     : {catalog}
+Environment : {env.upper()}
+Catalog     : {catalog}
+Volume      : {VOLUME_FULL_NAME}
+Source      : {TELEMETRY_SOURCE_PATH}
 
-The pipeline is configured to use:
+Verified:
+  - Required schemas exist
+  - Landing volume exists
+  - Source directory is accessible
+  - Configured paths and table names belong to {catalog}
 
-{TELEMETRY_SOURCE_PATH}
+Next:
+  - Prepare input data
+  - Initialize required business tables
+  - Run the processing tasks with env={env}
 
-and write only to:
-
-{catalog}.*
-
-No DEV/PROD data is shared through the configured
-table, schema-state or checkpoint paths.
+Each processing task must resolve its own configuration.
 """)
-
-# COMMAND ----------
-
-display(
-    spark.table("aviation_dev.bronze.telemetry")
-    .select(
-        "event_id",
-        "aircraft_id",
-        "flight_id",
-        "event_time",
-        "altitude_ft",
-        "ground_speed_kts",
-        "engine_temp_c",
-        "fuel_remaining_kg"
-    )
-    .orderBy("event_time")
-)
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-display(
-    spark.table("aviation_dev.bronze.telemetry")
-    .filter(F.col("event_id") == "EVT-004")
-)
-
-# COMMAND ----------
-
-test_data = """{"aircraft_id":"AC-101","altitude_ft":34000,"engine_temp_c":650.0,"event_id":"EVT-NEW-001","event_time":"2026-10-04T13:00:00","flight_id":"FL-001","fuel_remaining_kg":4500.0,"ground_speed_kts":460}
-{"aircraft_id":"AC-102","altitude_ft":31000,"engine_temp_c":630.0,"event_id":"EVT-LATE-002","event_time":"2026-10-02T11:45:00","flight_id":"FL-002","fuel_remaining_kg":4700.0,"ground_speed_kts":450}
-"""
-
-file_path = (
-    "/Volumes/aviation_dev/raw/landing/"
-    "telemetry/telemetry_005_incremental.jsonl"
-)
-
-dbutils.fs.put(
-    file_path,
-    test_data,
-    overwrite=True
-)
-
-print(file_path)
-
-# COMMAND ----------
-
-from pyspark.sql import functions as F
-
-display(
-    spark.table("aviation_dev.bronze.telemetry")
-    .filter(
-        F.col("event_id").isin(
-            "EVT-NEW-001",
-            "EVT-LATE-002"
-        )
-    )
-    .select(
-        "event_id",
-        "aircraft_id",
-        "flight_id",
-        "event_time",
-        "_ingest_ts"
-    )
-)
-
-# COMMAND ----------
-
-display(
-    spark.table("aviation_dev.gold.fact_telemetry_hourly")
-    .orderBy("aircraft_id", "flight_id", "telemetry_hour")
-)
-
-# COMMAND ----------
-
-test_data = """{"aircraft_id":"AC-101","altitude_ft":35000,"engine_temp_c":660.0,"event_id":"EVT-FAIL-001","event_time":"2026-10-04T13:10:00","flight_id":"FL-001","fuel_remaining_kg":4400.0,"ground_speed_kts":465}
-"""
-
-file_path = (
-    "/Volumes/aviation_dev/raw/landing/"
-    "telemetry/telemetry_006_failure_test.jsonl"
-)
-
-dbutils.fs.put(
-    file_path,
-    test_data,
-    overwrite=True
-)
-
-from pyspark.sql import functions as F
-print(file_path)
-
-# COMMAND ----------
-
-
-from pyspark.sql import functions as F
-
-display(
-    spark.table(CONTROL_TABLE)
-    .filter(F.col("pipeline_name") == PIPELINE_NAME)
-)

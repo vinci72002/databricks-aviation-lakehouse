@@ -1,117 +1,114 @@
 # Databricks notebook source
-# Databricks notebook source
-
 # ============================================================
-# DE-102 - Production Incremental Gold Pipeline
+# 03 - Incremental Gold Telemetry
 #
-# Stage 1:
-#   1. Support DEV / PROD environments
-#   2. Create processing control table
-#   3. Read last successful watermark
-#   4. Determine current batch upper watermark
-#   5. Detect Silver rows not yet processed by Gold
+# Detect new arrivals using _ingest_ts.
+# Recompute complete affected hourly / daily grains.
+# MERGE -> DQ -> optional failure injection -> watermark commit.
 #
-# IMPORTANT:
-#   This stage does NOT update the processing watermark.
-#   The watermark will only be advanced after:
-#
-#       Gold MERGE
-#           ↓
-#       DQ validation
-#           ↓
-#       Successful commit
-#
+# Run with max concurrent runs = 1.
 # ============================================================
 
+from datetime import datetime
 
-# COMMAND ----------
-# Environment Configuration
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+
+# 1. Parameters
 
 dbutils.widgets.text("env", "dev", "Environment")
+dbutils.widgets.dropdown(
+    "inject_failure",
+    "false",
+    ["false", "true"],
+    "Inject Failure",
+)
 
 env = dbutils.widgets.get("env").strip().lower()
+failure_value = dbutils.widgets.get("inject_failure").strip().lower()
 
 if env not in {"dev", "prod"}:
-    raise ValueError(
-        f"Invalid environment: '{env}'. "
-        "Allowed values: dev, prod"
-    )
+    raise ValueError(f"Invalid environment: {env!r}. Allowed: dev, prod")
+
+if failure_value not in {"false", "true"}:
+    raise ValueError(f"Invalid inject_failure value: {failure_value!r}")
+
+inject_failure = failure_value == "true"
+
+
+# 2. Configuration
 
 catalog = f"aviation_{env}"
 
-
-# COMMAND ----------
-# Imports
-
-from pyspark.sql import functions as F
-
-
-# COMMAND ----------
-# Environment-specific tables
-
-SILVER_TABLE = (
-    f"{catalog}.silver.telemetry"
-)
-
-HOURLY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_hourly"
-)
-
-DAILY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_daily"
-)
-
-CONTROL_TABLE = (
-    f"{catalog}.ops.pipeline_control"
-)
+SILVER_TABLE = f"{catalog}.silver.telemetry"
+HOURLY_TABLE = f"{catalog}.gold.fact_telemetry_hourly"
+DAILY_TABLE = f"{catalog}.gold.fact_telemetry_daily"
+CONTROL_TABLE = f"{catalog}.ops.pipeline_control"
 
 PIPELINE_NAME = "telemetry_gold"
+INITIAL_WATERMARK = datetime(1970, 1, 1)
 
-
-# COMMAND ----------
-# Environment isolation safety check
-
-expected_table_prefix = f"{catalog}."
-
-tables = [
+for table in (
     SILVER_TABLE,
     HOURLY_TABLE,
     DAILY_TABLE,
-    CONTROL_TABLE
-]
-
-for table in tables:
-    if not table.startswith(expected_table_prefix):
-        raise RuntimeError(
-            f"Environment isolation failed: {table}"
-        )
-
+    CONTROL_TABLE,
+):
+    if not table.startswith(f"{catalog}."):
+        raise RuntimeError(f"Environment isolation failed: {table}")
 
 print("=" * 60)
-print("DE-102 - INCREMENTAL GOLD PIPELINE")
+print("INCREMENTAL GOLD PIPELINE")
 print("=" * 60)
-
-print(f"Environment : {env.upper()}")
-print(f"Catalog     : {catalog}")
-print(f"Silver      : {SILVER_TABLE}")
-print(f"Gold Hourly : {HOURLY_TABLE}")
-print(f"Gold Daily  : {DAILY_TABLE}")
-print(f"Control     : {CONTROL_TABLE}")
-
-print("=" * 60)
-print("Environment isolation check: PASSED")
+print(f"Environment    : {env.upper()}")
+print(f"Silver         : {SILVER_TABLE}")
+print(f"Hourly         : {HOURLY_TABLE}")
+print(f"Daily          : {DAILY_TABLE}")
+print(f"Control        : {CONTROL_TABLE}")
+print(f"Inject failure : {inject_failure}")
 
 
-# COMMAND ----------
-# Create processing control table
-#
-# Auto Loader checkpoint:
-#   Tracks Raw -> Bronze ingestion progress.
-#
-# pipeline_control:
-#   Tracks Silver -> Gold processing progress.
-#
-# These are two different types of state.
+# 3. Validate Silver prerequisites
+
+if not spark.catalog.tableExists(SILVER_TABLE):
+    raise RuntimeError(f"Missing Silver table: {SILVER_TABLE}. Run 02 first.")
+
+silver_df = spark.table(SILVER_TABLE)
+
+required_columns = {
+    "event_id",
+    "aircraft_id",
+    "flight_id",
+    "event_time",
+    "_ingest_ts",
+    "altitude_ft",
+    "ground_speed_kts",
+    "engine_temp_c",
+    "fuel_remaining_kg",
+}
+
+missing_columns = required_columns - set(silver_df.columns)
+
+if missing_columns:
+    raise RuntimeError(f"Missing Silver columns: {sorted(missing_columns)}")
+
+invalid_keys = (
+    silver_df.filter(
+        F.col("event_id").isNull()
+        | F.col("aircraft_id").isNull()
+        | F.col("flight_id").isNull()
+        | F.col("event_time").isNull()
+        | F.col("_ingest_ts").isNull()
+    )
+    .limit(1)
+    .count()
+)
+
+if invalid_keys:
+    raise RuntimeError("Silver contains null keys or timestamps. Check 02.")
+
+
+# 4. Initialize control table and read watermark
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {CONTROL_TABLE} (
@@ -122,877 +119,289 @@ CREATE TABLE IF NOT EXISTS {CONTROL_TABLE} (
 USING DELTA
 """)
 
-print(
-    f"Control table ready: {CONTROL_TABLE}"
-)
-
-
-# COMMAND ----------
-# Initialize processing watermark
-#
-# This operation is idempotent.
-#
-# The record is created only if it does not already exist.
-#
-# 1970-01-01 means:
-#   No Silver data has been successfully processed yet.
-
 spark.sql(f"""
 MERGE INTO {CONTROL_TABLE} AS target
-
 USING (
     SELECT
-        '{PIPELINE_NAME}'
-            AS pipeline_name,
-
+        '{PIPELINE_NAME}' AS pipeline_name,
         TIMESTAMP('1970-01-01 00:00:00')
             AS last_success_watermark,
-
-        current_timestamp()
-            AS updated_at
+        current_timestamp() AS updated_at
 ) AS source
-
 ON target.pipeline_name = source.pipeline_name
+WHEN NOT MATCHED THEN INSERT *
+""")
 
-WHEN NOT MATCHED THEN
+control_rows = (
+    spark.table(CONTROL_TABLE)
+    .filter(F.col("pipeline_name") == PIPELINE_NAME)
+    .select("last_success_watermark")
+    .collect()
+)
 
-    INSERT (
-        pipeline_name,
-        last_success_watermark,
-        updated_at
+if len(control_rows) != 1:
+    raise RuntimeError(
+        f"Expected one control record for {PIPELINE_NAME}, "
+        f"found {len(control_rows)}."
     )
 
-    VALUES (
-        source.pipeline_name,
-        source.last_success_watermark,
-        source.updated_at
+last_watermark = control_rows[0]["last_success_watermark"]
+
+if last_watermark is None:
+    raise RuntimeError("Processing watermark is null.")
+
+print(f"Last watermark : {last_watermark}")
+
+
+# 5. Check first-run / recovery state
+#
+# Never silently create empty Gold tables when the watermark
+# indicates historical data has already been processed.
+
+missing_gold_tables = [
+    table
+    for table in (HOURLY_TABLE, DAILY_TABLE)
+    if not spark.catalog.tableExists(table)
+]
+
+if missing_gold_tables and last_watermark != INITIAL_WATERMARK:
+    raise RuntimeError(
+        "Gold tables are missing but the watermark has advanced. "
+        f"Missing: {missing_gold_tables}. "
+        "Restore Gold or perform a controlled full rebuild. "
+        "The watermark has not been reset."
     )
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {HOURLY_TABLE} (
+    aircraft_id STRING,
+    flight_id STRING,
+    telemetry_hour TIMESTAMP,
+    sample_count BIGINT,
+    avg_altitude_ft DOUBLE,
+    avg_ground_speed_kts DOUBLE,
+    avg_engine_temp_c DOUBLE,
+    max_engine_temp_c DOUBLE,
+    min_fuel_remaining_kg DOUBLE
+)
+USING DELTA
+""")
+
+spark.sql(f"""
+CREATE TABLE IF NOT EXISTS {DAILY_TABLE} (
+    aircraft_id STRING,
+    flight_id STRING,
+    telemetry_date DATE,
+    sample_count BIGINT,
+    avg_altitude_ft DOUBLE,
+    avg_ground_speed_kts DOUBLE,
+    avg_engine_temp_c DOUBLE,
+    max_engine_temp_c DOUBLE,
+    min_fuel_remaining_kg DOUBLE
+)
+USING DELTA
 """)
 
 
-# COMMAND ----------
-# Display current control state
-
-print("Current processing control state:")
-
-display(
-    spark.table(CONTROL_TABLE)
-    .filter(
-        F.col("pipeline_name")
-        == PIPELINE_NAME
-    )
-)
+# 6. Validate Gold grains
 
 
-# COMMAND ----------
-# Read last successful processing watermark
-
-control_row = (
-    spark.table(CONTROL_TABLE)
-    .filter(
-        F.col("pipeline_name")
-        == PIPELINE_NAME
-    )
-    .select(
-        "last_success_watermark"
-    )
-    .first()
-)
-
-if control_row is None:
-    raise RuntimeError(
-        f"Missing control record "
-        f"for pipeline: {PIPELINE_NAME}"
+def validate_gold():
+    definitions = (
+        (
+            HOURLY_TABLE,
+            ["aircraft_id", "flight_id", "telemetry_hour"],
+        ),
+        (
+            DAILY_TABLE,
+            ["aircraft_id", "flight_id", "telemetry_date"],
+        ),
     )
 
-last_watermark = (
-    control_row["last_success_watermark"]
-)
+    for table, keys in definitions:
+        df = spark.table(table)
 
-print(
-    f"Last successful watermark: "
-    f"{last_watermark}"
-)
+        duplicate_found = (
+            df.groupBy(*keys).count().filter(F.col("count") > 1).limit(1).count()
+        )
 
+        if duplicate_found:
+            raise RuntimeError(f"DQ FAILED: duplicate grains in {table}")
 
-# COMMAND ----------
-# Read Silver
-#
-# Silver is the source of truth for Gold aggregation.
+        invalid = F.col("sample_count").isNull() | (F.col("sample_count") <= 0)
 
-silver_df = spark.table(
-    SILVER_TABLE
-)
+        for key in keys:
+            invalid = invalid | F.col(key).isNull()
 
-silver_count = silver_df.count()
+        if df.filter(invalid).limit(1).count():
+            raise RuntimeError(
+                f"DQ FAILED: null grain keys or invalid " f"sample_count in {table}"
+            )
 
-print(
-    f"Silver input rows: "
-    f"{silver_count}"
-)
+    print("Gold DQ validation: PASSED")
 
 
-# COMMAND ----------
-# Validate required incremental-processing column
-
-required_columns = {
-    "event_id",
-    "aircraft_id",
-    "flight_id",
-    "event_time",
-    "_ingest_ts"
-}
-
-missing_columns = (
-    required_columns
-    - set(silver_df.columns)
-)
-
-if missing_columns:
-    raise RuntimeError(
-        "Silver table is missing required columns: "
-        f"{sorted(missing_columns)}"
-    )
-
-print(
-    "Required Silver columns: PASSED"
-)
+# Check existing targets before MERGE.
+validate_gold()
 
 
-# COMMAND ----------
-# Determine current batch upper watermark
-#
-# We create a fixed processing window:
-#
-#   last_success_watermark
-#            <
-#       _ingest_ts
-#            <=
-#       upper_watermark
-#
-# upper_watermark is the maximum ingestion timestamp
-# currently available in Silver.
+# 7. Fix the processing window
 
-upper_watermark_row = (
-    silver_df
-    .agg(
-        F.max("_ingest_ts")
-        .alias("upper_watermark")
-    )
-    .first()
-)
-
-upper_watermark = (
-    upper_watermark_row[
-        "upper_watermark"
-    ]
-)
-
-print()
-print("=" * 60)
-print("PROCESSING WINDOW")
-print("=" * 60)
-
-print(
-    f"Last watermark : "
-    f"{last_watermark}"
-)
-
-print(
-    f"Upper watermark: "
-    f"{upper_watermark}"
-)
-
-
-# COMMAND ----------
-# Detect Silver rows not yet processed by Gold
-#
-# IMPORTANT:
-#
-# We use _ingest_ts instead of event_time.
-#
-# A late-arriving event may have:
-#
-#   event_time = yesterday
-#   _ingest_ts = today
-#
-# It must still be detected as newly arrived data.
+upper_watermark = silver_df.agg(F.max("_ingest_ts").alias("upper_watermark")).first()[
+    "upper_watermark"
+]
 
 if upper_watermark is None:
-
-    changed_df = (
-        silver_df
-        .limit(0)
-    )
-
-else:
-
-    changed_df = (
-        silver_df
-        .filter(
-            (
-                F.col("_ingest_ts")
-                > F.lit(last_watermark)
-            )
-            &
-            (
-                F.col("_ingest_ts")
-                <= F.lit(upper_watermark)
-            )
-        )
-    )
-
-
-# COMMAND ----------
-# Count changed Silver rows
-
-changed_count = (
-    changed_df.count()
-)
-
-# No new data -> finish safely
-
-if changed_count == 0:
-    print("=" * 60)
-    print("NO NEW DATA")
-    print("=" * 60)
-    print("No new Silver rows detected.")
-    print("Gold processing is not required.")
-    print("Watermark remains unchanged.")
-
+    print("Silver is empty. Watermark remains unchanged.")
     dbutils.notebook.exit("NO_NEW_DATA")
 
-
-    
-
-
-print()
-print("=" * 60)
-print("INCREMENTAL DETECTION RESULT")
-print("=" * 60)
-
-print(
-    f"Silver rows         : "
-    f"{silver_count}"
+changed_df = silver_df.filter(
+    (F.col("_ingest_ts") > F.lit(last_watermark))
+    & (F.col("_ingest_ts") <= F.lit(upper_watermark))
 )
 
-print(
-    f"Changed Silver rows : "
-    f"{changed_count}"
-)
+changed_count = changed_df.count()
 
-print(
-    f"Last watermark      : "
-    f"{last_watermark}"
-)
+print(f"Upper watermark: {upper_watermark}")
+print(f"Changed rows   : {changed_count}")
 
-print(
-    f"Upper watermark     : "
-    f"{upper_watermark}"
-)
+if changed_count == 0:
+    print("No new arrivals. Watermark remains unchanged.")
+    dbutils.notebook.exit("NO_NEW_DATA")
+
+# Use a bounded source for all recomputations in this run.
+batch_source_df = silver_df.filter(F.col("_ingest_ts") <= F.lit(upper_watermark))
 
 
-# COMMAND ----------
-# Display changed rows
-
-display(
-    changed_df
-    .select(
-        "event_id",
-        "aircraft_id",
-        "flight_id",
-        "event_time",
-        "_ingest_ts"
-    )
-    .orderBy(
-        "_ingest_ts",
-        "event_id"
-    )
-)
+# 8. Recompute complete affected grains
 
 
-# COMMAND ----------
-# Stage 1 validation
-#
-# IMPORTANT:
-#
-# DO NOT update last_success_watermark here.
-#
-# At this point we have only DETECTED the data.
-#
-# The production sequence must be:
-#
-#   Detect changed rows
-#       ↓
-#   Find affected grains
-#       ↓
-#   Recompute complete affected grains
-#       ↓
-#   MERGE Gold
-#       ↓
-#   DQ validation
-#       ↓
-#   COMMITTED
-#       ↓
-#   Advance watermark
-#
-# If processing fails before COMMITTED,
-# the watermark must remain unchanged.
+def recompute_grains(grain_column, grain_expression):
+    keys = ["aircraft_id", "flight_id", grain_column]
 
-print()
-print("=" * 60)
-print("DE-102 STAGE 1 COMPLETED")
-print("=" * 60)
-
-if upper_watermark is None:
-
-    print(
-        "No Silver data is available."
+    affected_df = (
+        changed_df.withColumn(grain_column, grain_expression).select(*keys).distinct()
     )
 
-elif changed_count == 0:
+    complete_source_df = batch_source_df.withColumn(
+        grain_column, grain_expression
+    ).join(affected_df, on=keys, how="inner")
 
-    print(
-        "No new Silver rows detected."
-    )
-
-else:
-
-    print(
-        f"{changed_count} Silver rows "
-        "are waiting for Gold processing."
-    )
-
-print()
-print(
-    "Processing watermark has NOT been advanced."
-)
-
-print(
-    "Next step: determine affected "
-    "hourly and daily grains."
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.1
-# Find affected hourly grains
-
-affected_hourly_df = (
-    changed_df
-    .withColumn(
-        "telemetry_hour",
-        F.date_trunc(
-            "hour",
-            F.col("event_time")
-        )
-    )
-    .select(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-    .distinct()
-)
-
-affected_hourly_count = affected_hourly_df.count()
-
-print(
-    f"Affected hourly grains: "
-    f"{affected_hourly_count}"
-)
-
-display(
-    affected_hourly_df
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.2
-# Read complete Silver rows for affected hourly grains
-
-silver_hourly_df = (
-    silver_df
-    .withColumn(
-        "telemetry_hour",
-        F.date_trunc(
-            "hour",
-            F.col("event_time")
-        )
-    )
-)
-
-affected_hourly_source_df = (
-    silver_hourly_df
-    .join(
-        affected_hourly_df,
-        on=[
-            "aircraft_id",
-            "flight_id",
-            "telemetry_hour"
-        ],
-        how="inner"
-    )
-)
-
-source_count = affected_hourly_source_df.count()
-
-print(
-    f"Complete Silver rows for affected hours: "
-    f"{source_count}"
-)
-
-display(
-    affected_hourly_source_df
-    .select(
-        "event_id",
-        "aircraft_id",
-        "flight_id",
-        "event_time",
-        "telemetry_hour",
-        "engine_temp_c"
-    )
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "event_time"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.3
-# Recompute complete affected hourly grains
-
-hourly_updates_df = (
-    affected_hourly_source_df
-    .groupBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-    .agg(
+    updates_df = complete_source_df.groupBy(*keys).agg(
         F.count("*").alias("sample_count"),
-
-        F.avg("altitude_ft").alias(
-            "avg_altitude_ft"
-        ),
-
-        F.avg("ground_speed_kts").alias(
-            "avg_ground_speed_kts"
-        ),
-
-        F.avg("engine_temp_c").alias(
-            "avg_engine_temp_c"
-        ),
-
-        F.max("engine_temp_c").alias(
-            "max_engine_temp_c"
-        ),
-
-        F.min("fuel_remaining_kg").alias(
-            "min_fuel_remaining_kg"
-        )
-    )
-)
-
-print(
-    f"Recomputed hourly grains: "
-    f"{hourly_updates_df.count()}"
-)
-
-display(
-    hourly_updates_df
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.4
-# MERGE affected hourly grains into Gold
-
-from delta.tables import DeltaTable
-
-hourly_gold = DeltaTable.forName(
-    spark,
-    HOURLY_TABLE
-)
-
-(
-    hourly_gold.alias("target")
-    .merge(
-        hourly_updates_df.alias("source"),
-        """
-        target.aircraft_id = source.aircraft_id
-        AND target.flight_id = source.flight_id
-        AND target.telemetry_hour = source.telemetry_hour
-        """
-    )
-    .whenMatchedUpdateAll()
-    .whenNotMatchedInsertAll()
-    .execute()
-)
-
-print("Hourly Gold MERGE completed.")
-
-display(
-    spark.table(HOURLY_TABLE)
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.5
-# Find affected daily grains
-
-affected_daily_df = (
-    changed_df
-    .withColumn(
-        "telemetry_date",
-        F.to_date(
-            F.col("event_time")
-        )
-    )
-    .select(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_date"
-    )
-    .distinct()
-)
-
-affected_daily_count = affected_daily_df.count()
-
-print(
-    f"Affected daily grains: "
-    f"{affected_daily_count}"
-)
-
-display(
-    affected_daily_df
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_date"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 2.6
-# Recompute and MERGE affected daily grains
-
-
-# 1. Add daily grain key to complete Silver data
-
-silver_daily_df = (
-    silver_df
-    .withColumn(
-        "telemetry_date",
-        F.to_date(
-            F.col("event_time")
-        )
-    )
-)
-
-
-# 2. Read complete Silver rows
-#    belonging to affected daily grains
-
-affected_daily_source_df = (
-    silver_daily_df
-    .join(
-        affected_daily_df,
-        on=[
-            "aircraft_id",
-            "flight_id",
-            "telemetry_date"
-        ],
-        how="inner"
-    )
-)
-
-
-# 3. Recompute complete affected daily grains
-
-daily_updates_df = (
-    affected_daily_source_df
-    .groupBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_date"
-    )
-    .agg(
-        F.count("*").alias("sample_count"),
-
-        F.avg("altitude_ft").alias(
-            "avg_altitude_ft"
-        ),
-
-        F.avg("ground_speed_kts").alias(
-            "avg_ground_speed_kts"
-        ),
-
-        F.avg("engine_temp_c").alias(
-            "avg_engine_temp_c"
-        ),
-
-        F.max("engine_temp_c").alias(
-            "max_engine_temp_c"
-        ),
-
-        F.min("fuel_remaining_kg").alias(
-            "min_fuel_remaining_kg"
-        )
-    )
-)
-
-
-# 4. MERGE into Daily Gold
-
-daily_gold = DeltaTable.forName(
-    spark,
-    DAILY_TABLE
-)
-
-(
-    daily_gold.alias("target")
-    .merge(
-        daily_updates_df.alias("source"),
-        """
-        target.aircraft_id = source.aircraft_id
-        AND target.flight_id = source.flight_id
-        AND target.telemetry_date = source.telemetry_date
-        """
-    )
-    .whenMatchedUpdateAll()
-    .whenNotMatchedInsertAll()
-    .execute()
-)
-
-
-print("Daily Gold MERGE completed.")
-
-display(
-    spark.table(DAILY_TABLE)
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_date"
-    )
-)
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 3.1
-# Validate Gold before committing processing watermark
-
-
-# Check duplicate Hourly grains
-
-hourly_duplicate_count = (
-    spark.table(HOURLY_TABLE)
-    .groupBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-    .count()
-    .filter(
-        F.col("count") > 1
-    )
-    .count()
-)
-
-
-# Check duplicate Daily grains
-
-daily_duplicate_count = (
-    spark.table(DAILY_TABLE)
-    .groupBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_date"
-    )
-    .count()
-    .filter(
-        F.col("count") > 1
-    )
-    .count()
-)
-
-
-print(
-    f"Hourly duplicate grains: "
-    f"{hourly_duplicate_count}"
-)
-
-print(
-    f"Daily duplicate grains : "
-    f"{daily_duplicate_count}"
-)
-
-
-if hourly_duplicate_count > 0:
-    raise RuntimeError(
-        "DQ FAILED: duplicate hourly grains"
+        F.avg("altitude_ft").alias("avg_altitude_ft"),
+        F.avg("ground_speed_kts").alias("avg_ground_speed_kts"),
+        F.avg("engine_temp_c").alias("avg_engine_temp_c"),
+        F.max("engine_temp_c").alias("max_engine_temp_c"),
+        F.min("fuel_remaining_kg").alias("min_fuel_remaining_kg"),
     )
 
-if daily_duplicate_count > 0:
-    raise RuntimeError(
-        "DQ FAILED: duplicate daily grains"
+    return updates_df, keys
+
+
+hourly_updates_df, hourly_keys = recompute_grains(
+    "telemetry_hour",
+    F.date_trunc("hour", F.col("event_time")),
+)
+
+daily_updates_df, daily_keys = recompute_grains(
+    "telemetry_date",
+    F.to_date("event_time"),
+)
+
+hourly_grain_count = hourly_updates_df.count()
+daily_grain_count = daily_updates_df.count()
+
+print(f"Affected hourly grains: {hourly_grain_count}")
+print(f"Affected daily grains : {daily_grain_count}")
+
+
+# 9. MERGE Gold
+#
+# Replace each affected grain's metrics.
+# Do not add the new count to the existing count.
+
+
+def merge_gold(table, updates_df, keys):
+    condition = " AND ".join(f"target.{key} = source.{key}" for key in keys)
+
+    (
+        DeltaTable.forName(spark, table)
+        .alias("target")
+        .merge(updates_df.alias("source"), condition)
+        .whenMatchedUpdateAll()
+        .whenNotMatchedInsertAll()
+        .execute()
     )
 
+    print(f"MERGE completed: {table}")
 
-print("Gold DQ validation: PASSED")
 
-# COMMAND ----------
+merge_gold(HOURLY_TABLE, hourly_updates_df, hourly_keys)
+merge_gold(DAILY_TABLE, daily_updates_df, daily_keys)
 
-# COMMAND ----------
-# DE-102 Validation 3
-# Failure injection before watermark commit
 
-dbutils.widgets.dropdown(
-    "inject_failure",
-    "false",
-    ["false", "true"],
-    "Inject Failure"
-)
+# 10. Validate Gold before watermark commit
 
-inject_failure = (
-    dbutils.widgets
-    .get("inject_failure")
-    .lower() == "true"
-)
+validate_gold()
+
+
+# 11. Optional failure injection
 
 if inject_failure:
     raise RuntimeError(
-        "DE-102 TEST FAILURE: "
-        "Failure injected before watermark commit."
-    )
-
-print("Failure injection: OFF")
-
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Stage 3.2
-# Commit successful processing watermark
-
-if upper_watermark is not None:
-
-    spark.sql(f"""
-        UPDATE {CONTROL_TABLE}
-
-        SET
-            last_success_watermark =
-                TIMESTAMP('{upper_watermark}'),
-
-            updated_at =
-                current_timestamp()
-
-        WHERE pipeline_name =
-            '{PIPELINE_NAME}'
-    """)
-
-    print(
-        "Processing watermark committed:"
-    )
-
-    print(
-        f"{last_watermark}"
-        f"  ->  "
-        f"{upper_watermark}"
-    )
-
-else:
-
-    print(
-        "No Silver data available. "
-        "Watermark unchanged."
+        "TEST FAILURE: injected after Gold MERGE and DQ, "
+        "before watermark commit. "
+        "Gold writes may already be present; rerun safely "
+        "with inject_failure=false."
     )
 
 
-# COMMAND ----------
-# Verify control state
+# 12. Commit watermark using a typed DataFrame
+#
+# No timestamp-to-SQL-string conversion is required.
 
-display(
-    spark.table(CONTROL_TABLE)
-    .filter(
-        F.col("pipeline_name")
-        == PIPELINE_NAME
+commit_df = spark.createDataFrame(
+    [(PIPELINE_NAME, upper_watermark)],
+    schema=("pipeline_name STRING, " "last_success_watermark TIMESTAMP"),
+).withColumn("updated_at", F.current_timestamp())
+
+(
+    DeltaTable.forName(spark, CONTROL_TABLE)
+    .alias("target")
+    .merge(
+        commit_df.alias("source"),
+        "target.pipeline_name = source.pipeline_name",
     )
+    .whenMatchedUpdate(
+        set={
+            "last_success_watermark": "source.last_success_watermark",
+            "updated_at": "source.updated_at",
+        }
+    )
+    .execute()
 )
 
-# COMMAND ----------
-
-# COMMAND ----------
-# DE-102 Validation 1
-# Check for Silver rows after committed watermark
-
-current_watermark = (
+committed_watermark = (
     spark.table(CONTROL_TABLE)
-    .filter(
-        F.col("pipeline_name") == PIPELINE_NAME
-    )
+    .filter(F.col("pipeline_name") == PIPELINE_NAME)
     .select("last_success_watermark")
     .first()["last_success_watermark"]
 )
 
-new_rows_df = (
-    spark.table(SILVER_TABLE)
-    .filter(
-        F.col("_ingest_ts") > F.lit(current_watermark)
-    )
-)
+if committed_watermark != upper_watermark:
+    raise RuntimeError("Watermark verification failed after commit.")
 
-new_row_count = new_rows_df.count()
 
-print(f"Current watermark : {current_watermark}")
-print(f"New Silver rows   : {new_row_count}")
+# 13. Final status
 
-# COMMAND ----------
-
-display(
-    spark.table(HOURLY_TABLE)
-    .orderBy(
-        "aircraft_id",
-        "flight_id",
-        "telemetry_hour"
-    )
-)
-
-# COMMAND ----------
-
-display(
-    spark.table(CONTROL_TABLE)
-    .filter(F.col("pipeline_name") == PIPELINE_NAME)
-)
-
-# COMMAND ----------
-
-display(
-    spark.table(CONTROL_TABLE)
-    .filter(F.col("pipeline_name") == PIPELINE_NAME)
-    .select("last_success_watermark", "updated_at")
-)
+print()
+print("=" * 60)
+print("INCREMENTAL GOLD PIPELINE: SUCCESS")
+print("=" * 60)
+print(f"Environment    : {env.upper()}")
+print(f"Changed rows   : {changed_count}")
+print(f"Hourly grains  : {hourly_grain_count}")
+print(f"Daily grains   : {daily_grain_count}")
+print(f"Old watermark  : {last_watermark}")
+print(f"New watermark  : {committed_watermark}")

@@ -1,122 +1,64 @@
 # Databricks notebook source
-# Databricks notebook source
-
-# COMMAND ----------
-# DE-101 - Environment Configuration
+# ============================================================
+# 05 - Data Quality Gate & Audit
 #
-# Same notebook supports:
-#   env=dev  -> aviation_dev
-#   env=prod -> aviation_prod
+# Audit states: RUNNING -> PASSED / FAILED
+#
+# This task validates existing outputs.
+# It does not commit or roll back upstream data or watermarks.
+# ============================================================
+
+import uuid
+
+from delta.tables import DeltaTable
+from pyspark.sql import functions as F
+
+# 1. Parameters
 
 dbutils.widgets.text("env", "dev", "Environment")
+dbutils.widgets.dropdown(
+    "inject_failure",
+    "false",
+    ["false", "true"],
+    "Inject Failure",
+)
 
 env = dbutils.widgets.get("env").strip().lower()
+failure_value = dbutils.widgets.get("inject_failure").strip().lower()
 
 if env not in {"dev", "prod"}:
-    raise ValueError(
-        f"Invalid environment: '{env}'. "
-        "Allowed values: dev, prod"
-    )
+    raise ValueError(f"Invalid environment: {env!r}. Allowed: dev, prod")
+
+if failure_value not in {"false", "true"}:
+    raise ValueError(f"Invalid inject_failure value: {failure_value!r}")
+
+inject_failure = failure_value == "true"
+
+
+# 2. Environment-specific tables
 
 catalog = f"aviation_{env}"
 
-
-# COMMAND ----------
-# Imports
-
-from pyspark.sql import functions as F
-from delta.tables import DeltaTable
-from datetime import datetime
-import uuid
-
-
-# COMMAND ----------
-# Environment-specific tables
-
 SILVER_TABLE = f"{catalog}.silver.telemetry"
-
-HOURLY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_hourly"
-)
-
-DAILY_TABLE = (
-    f"{catalog}.gold.fact_telemetry_daily"
-)
-
-DIM_TABLE = (
-    f"{catalog}.gold.dim_aircraft"
-)
-
-AUDIT_TABLE = (
-    f"{catalog}.ops.pipeline_audit"
-)
-
-
-# COMMAND ----------
-# Environment isolation safety check
-
-expected_table_prefix = f"{catalog}."
-
-tables = [
-    SILVER_TABLE,
-    HOURLY_TABLE,
-    DAILY_TABLE,
-    DIM_TABLE,
-    AUDIT_TABLE
-]
-
-for table in tables:
-    if not table.startswith(expected_table_prefix):
-        raise RuntimeError(
-            f"Environment isolation failed: {table}"
-        )
-
-
-print("=" * 60)
-print("DQ & FAILURE RECOVERY")
-print("=" * 60)
-
-print(f"Environment : {env.upper()}")
-print(f"Catalog     : {catalog}")
-print(f"Silver      : {SILVER_TABLE}")
-print(f"Hourly      : {HOURLY_TABLE}")
-print(f"Daily       : {DAILY_TABLE}")
-print(f"Dimension   : {DIM_TABLE}")
-print(f"Audit       : {AUDIT_TABLE}")
-
-print("=" * 60)
-print("Environment isolation check: PASSED")
-
-
-# COMMAND ----------
-# Job parameter
-#
-# false = normal run
-# true  = controlled failure test
-
-dbutils.widgets.text(
-    "inject_failure",
-    "false",
-    "Inject Failure"
-)
-
-inject_failure = (
-    dbutils.widgets
-    .get("inject_failure")
-    .strip()
-    .lower()
-    == "true"
-)
+HOURLY_TABLE = f"{catalog}.gold.fact_telemetry_hourly"
+DAILY_TABLE = f"{catalog}.gold.fact_telemetry_daily"
+DIM_TABLE = f"{catalog}.gold.dim_aircraft"
+AUDIT_TABLE = f"{catalog}.ops.pipeline_audit"
 
 batch_id = str(uuid.uuid4())
 
-print()
-print(f"batch_id       : {batch_id}")
-print(f"inject_failure : {inject_failure}")
+print("=" * 60)
+print("DATA QUALITY GATE")
+print("=" * 60)
+print(f"Environment    : {env.upper()}")
+print(f"Audit table    : {AUDIT_TABLE}")
+print(f"Batch ID       : {batch_id}")
+print(f"Inject failure : {inject_failure}")
 
 
-# COMMAND ----------
-# Create environment-specific audit table
+# 3. Create audit table
+#
+# Compatible with the existing audit table schema.
 
 spark.sql(f"""
 CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
@@ -129,243 +71,162 @@ CREATE TABLE IF NOT EXISTS {AUDIT_TABLE} (
 USING DELTA
 """)
 
-print(f"Audit table ready: {AUDIT_TABLE}")
+audit_start_df = spark.range(1).select(
+    F.lit(batch_id).alias("batch_id"),
+    F.lit("RUNNING").alias("status"),
+    F.current_timestamp().alias("started_at"),
+    F.lit(None).cast("timestamp").alias("completed_at"),
+    F.lit(None).cast("string").alias("error_message"),
+)
+
+(audit_start_df.write.format("delta").mode("append").saveAsTable(AUDIT_TABLE))
+
+audit = DeltaTable.forName(spark, AUDIT_TABLE)
 
 
-# COMMAND ----------
-# Record pipeline start
+# 4. Audit update helper
+#
+# Use literal columns instead of building SQL strings
+# from exception messages.
 
-audit_start = spark.createDataFrame(
-    [
-        (
-            batch_id,
-            "RUNNING",
-            datetime.now(),
-            None,
-            None
+
+def update_audit(status, error_message=None):
+    audit.update(
+        condition=F.col("batch_id") == F.lit(batch_id),
+        set={
+            "status": F.lit(status),
+            "completed_at": F.current_timestamp(),
+            "error_message": F.lit(error_message).cast("string"),
+        },
+    )
+
+
+# 5. DQ helpers
+
+
+def duplicate_group_count(df, keys):
+    return df.groupBy(*keys).count().filter(F.col("count") > 1).count()
+
+
+def invalid_key_condition(keys):
+    condition = F.lit(False)
+
+    for key in keys:
+        condition = condition | (
+            F.col(key).isNull() | (F.length(F.trim(F.col(key).cast("string"))) == 0)
         )
-    ],
-    """
-    batch_id STRING,
-    status STRING,
-    started_at TIMESTAMP,
-    completed_at TIMESTAMP,
-    error_message STRING
-    """
-)
 
-(
-    audit_start.write
-    .mode("append")
-    .saveAsTable(AUDIT_TABLE)
-)
-
-audit = DeltaTable.forName(
-    spark,
-    AUDIT_TABLE
-)
+    return condition
 
 
-# COMMAND ----------
-# Execute DQ Gate
+# 6. Execute DQ checks
 
 try:
+    for table in (
+        SILVER_TABLE,
+        HOURLY_TABLE,
+        DAILY_TABLE,
+        DIM_TABLE,
+    ):
+        if not spark.catalog.tableExists(table):
+            raise RuntimeError(f"Required table is missing: {table}")
 
-    # ---------------------------------------------------------
-    # Controlled failure test
-    # ---------------------------------------------------------
+    silver_df = spark.table(SILVER_TABLE)
+    hourly_df = spark.table(HOURLY_TABLE)
+    daily_df = spark.table(DAILY_TABLE)
+    dim_df = spark.table(DIM_TABLE)
 
-    if inject_failure:
+    results = {}
 
-        raise Exception(
-            "CONTROLLED FAILURE: "
-            "simulated pipeline crash"
-        )
+    results["silver_invalid_keys"] = silver_df.filter(
+        invalid_key_condition(["event_id", "aircraft_id", "flight_id"])
+        | F.col("event_time").isNull()
+        | F.col("_ingest_ts").isNull()
+    ).count()
 
+    results["silver_duplicate_events"] = duplicate_group_count(silver_df, ["event_id"])
 
-    # ---------------------------------------------------------
-    # DQ Check 1
-    # Gold Hourly must contain unique grains
-    # ---------------------------------------------------------
+    gold_definitions = (
+        (
+            "hourly",
+            hourly_df,
+            ["aircraft_id", "flight_id", "telemetry_hour"],
+        ),
+        (
+            "daily",
+            daily_df,
+            ["aircraft_id", "flight_id", "telemetry_date"],
+        ),
+    )
 
-    hourly_duplicates = (
-        spark.table(HOURLY_TABLE)
-        .groupBy(
-            "aircraft_id",
-            "flight_id",
-            "telemetry_hour"
-        )
-        .count()
-        .filter(
-            F.col("count") > 1
-        )
+    for name, df, keys in gold_definitions:
+        results[f"{name}_duplicate_grains"] = duplicate_group_count(df, keys)
+
+        results[f"{name}_invalid_rows"] = df.filter(
+            invalid_key_condition(keys)
+            | F.col("sample_count").isNull()
+            | (F.col("sample_count") <= 0)
+        ).count()
+
+    results["scd2_duplicate_versions"] = duplicate_group_count(
+        dim_df, ["aircraft_id", "effective_from"]
+    )
+
+    results["scd2_invalid_rows"] = dim_df.filter(
+        invalid_key_condition(["aircraft_id"])
+        | F.col("effective_from").isNull()
+        | F.col("effective_to").isNull()
+        | F.col("is_current").isNull()
+        | F.col("aircraft_sk").isNull()
+        | (F.col("effective_from") >= F.col("effective_to"))
+    ).count()
+
+    results["scd2_invalid_current_count"] = (
+        dim_df.groupBy("aircraft_id")
+        .agg(F.sum(F.when(F.col("is_current"), 1).otherwise(0)).alias("current_count"))
+        .filter(F.col("current_count") != 1)
         .count()
     )
 
-
-    # ---------------------------------------------------------
-    # DQ Check 2
-    # Gold Daily must contain unique grains
-    # ---------------------------------------------------------
-
-    daily_duplicates = (
-        spark.table(DAILY_TABLE)
-        .groupBy(
-            "aircraft_id",
-            "flight_id",
-            "telemetry_date"
-        )
-        .count()
-        .filter(
-            F.col("count") > 1
-        )
-        .count()
-    )
-
-
-    # ---------------------------------------------------------
-    # DQ Check 3
-    # Silver business keys cannot be NULL
-    # ---------------------------------------------------------
-
-    silver_null_keys = (
-        spark.table(SILVER_TABLE)
-        .filter(
-            F.col("event_id").isNull()
-            | F.col("aircraft_id").isNull()
-            | F.col("flight_id").isNull()
-        )
-        .count()
-    )
-
-
-    # ---------------------------------------------------------
-    # DQ Check 4
-    # SCD2: maximum one current row per aircraft
-    # ---------------------------------------------------------
-
-    scd2_violations = (
-        spark.table(DIM_TABLE)
-        .filter(
-            F.col("is_current") == True
-        )
-        .groupBy(
-            "aircraft_id"
-        )
-        .count()
-        .filter(
-            F.col("count") > 1
-        )
-        .count()
-    )
-
-
-    # ---------------------------------------------------------
-    # Display DQ results
-    # ---------------------------------------------------------
-
-    print()
-    print("DQ RESULTS")
+    print("\nDQ RESULTS")
     print("-" * 60)
 
-    print(
-        "Hourly duplicate grains:",
-        hourly_duplicates
-    )
+    for name, count in results.items():
+        print(f"{name:<36}: {count}")
 
-    print(
-        "Daily duplicate grains :",
-        daily_duplicates
-    )
+    failed_checks = {name: count for name, count in results.items() if count > 0}
 
-    print(
-        "Silver null keys        :",
-        silver_null_keys
-    )
+    if failed_checks:
+        raise RuntimeError(f"DQ gate failed: {failed_checks}")
 
-    print(
-        "SCD2 violations         :",
-        scd2_violations
-    )
-
-
-    # ---------------------------------------------------------
-    # DQ Gate
-    # ---------------------------------------------------------
-
-    dq_failed = (
-        hourly_duplicates > 0
-        or daily_duplicates > 0
-        or silver_null_keys > 0
-        or scd2_violations > 0
-    )
-
-    if dq_failed:
-        raise Exception(
-            "DQ Gate FAILED"
+    # Inject failure after real checks, before marking PASSED.
+    if inject_failure:
+        raise RuntimeError(
+            "CONTROLLED FAILURE: injected in the DQ task " "before recording PASSED."
         )
 
+    update_audit("PASSED")
 
-    # ---------------------------------------------------------
-    # Commit audit status
-    # ---------------------------------------------------------
+    print("\nDQ GATE: PASSED")
+    print("Audit recorded successfully.")
 
-    audit.update(
-        condition=f"batch_id = '{batch_id}'",
-        set={
-            "status": "'COMMITTED'",
-            "completed_at":
-                "current_timestamp()"
-        }
-    )
+except Exception as error:
+    # Preserve the original task error if audit recording fails.
+    try:
+        update_audit("FAILED", str(error)[:8000])
+    except Exception as audit_error:
+        print(
+            "Could not record FAILED audit status:",
+            str(audit_error),
+        )
 
-    print()
-    print("DQ Gate PASSED")
-    print("Pipeline COMMITTED")
-
-
-# COMMAND ----------
-# Failure handling
-
-except Exception as e:
-
-    error = str(e).replace(
-        "'",
-        "''"
-    )
-
-    audit.update(
-        condition=f"batch_id = '{batch_id}'",
-        set={
-            "status": "'FAILED'",
-            "completed_at":
-                "current_timestamp()",
-            "error_message":
-                f"'{error}'"
-        }
-    )
-
-    print()
-    print(
-        "Pipeline FAILED:",
-        str(e)
-    )
+    print("\nDQ GATE: FAILED")
+    print(str(error))
+    print(f"Batch ID: {batch_id}")
 
     raise
 
 
-# COMMAND ----------
-# Final audit validation
+# 7. Display recent audit records
 
-print()
-print("=" * 60)
-print("LATEST PIPELINE AUDIT")
-print("=" * 60)
-
-display(
-    spark.table(AUDIT_TABLE)
-    .orderBy(
-        F.col("started_at").desc()
-    )
-    .limit(10)
-)
+display(spark.table(AUDIT_TABLE).orderBy(F.col("started_at").desc()).limit(10))

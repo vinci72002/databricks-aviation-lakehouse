@@ -1,36 +1,32 @@
 # Databricks notebook source
-# Databricks notebook source
-
-# COMMAND ----------
-# DE-101 - Environment Configuration
+# ============================================================
+# 01 - Bronze Telemetry
+# DE-103 - Aviation Lakehouse
 #
-# Same notebook supports:
-#   env=dev  -> aviation_dev
-#   env=prod -> aviation_prod
+# JSON files -> Auto Loader -> Bronze Delta table
+#
+# Prerequisites:
+#   - 00_environment_setup completed
+#   - Input JSON files prepared
+#
+# Keep schema and checkpoint paths stable between runs.
+# ============================================================
+
+from pyspark.sql import functions as F
+
+# 1. Runtime parameter
 
 dbutils.widgets.text("env", "dev", "Environment")
 
 env = dbutils.widgets.get("env").strip().lower()
 
 if env not in {"dev", "prod"}:
-    raise ValueError(
-        f"Invalid environment: '{env}'. "
-        "Allowed values: dev, prod"
-    )
+    raise ValueError(f"Invalid environment: {env!r}. " "Allowed values: dev, prod")
+
+
+# 2. Resolve configuration independently
 
 catalog = f"aviation_{env}"
-
-print("=" * 60)
-print("BRONZE TELEMETRY PIPELINE")
-print("=" * 60)
-print(f"Environment : {env.upper()}")
-print(f"Catalog     : {catalog}")
-
-
-# COMMAND ----------
-# Environment-specific configuration
-
-from pyspark.sql import functions as F
 
 RAW_VOLUME = f"/Volumes/{catalog}/raw/landing"
 
@@ -41,46 +37,63 @@ CHECKPOINT_PATH = f"{RAW_VOLUME}/_checkpoints/bronze_telemetry"
 BRONZE_TABLE = f"{catalog}.bronze.telemetry"
 
 
-# COMMAND ----------
-# Environment isolation safety check
+# 3. Validate configuration before processing
 
-expected_volume_prefix = f"/Volumes/{catalog}/"
-expected_table_prefix = f"{catalog}."
+paths = {
+    "source": SOURCE_PATH,
+    "schema": SCHEMA_PATH,
+    "checkpoint": CHECKPOINT_PATH,
+}
 
-for path in [
-    SOURCE_PATH,
-    SCHEMA_PATH,
-    CHECKPOINT_PATH
-]:
-    if not path.startswith(expected_volume_prefix):
-        raise RuntimeError(
-            f"Environment isolation failed: {path}"
-        )
+for name, path in paths.items():
+    if not path.startswith(f"{RAW_VOLUME}/"):
+        raise RuntimeError(f"Environment isolation failed for {name}: {path}")
 
-if not BRONZE_TABLE.startswith(expected_table_prefix):
-    raise RuntimeError(
-        f"Environment isolation failed: {BRONZE_TABLE}"
+    if any(part in {".", ".."} for part in path.split("/")):
+        raise RuntimeError(f"Unexpected relative path component: {path}")
+
+if len(set(paths.values())) != len(paths):
+    raise RuntimeError("Source, schema and checkpoint paths must be distinct.")
+
+if BRONZE_TABLE != f"{catalog}.bronze.telemetry":
+    raise RuntimeError(f"Unexpected Bronze target: {BRONZE_TABLE}")
+
+print("Configuration validation: PASSED")
+
+
+# 4. Verify prerequisites
+#
+# Fail if the Bronze schema or source directory is unavailable.
+# An empty directory is allowed here, but the first Auto Loader
+# run needs input files to infer the schema.
+
+spark.sql(f"DESCRIBE SCHEMA `{catalog}`.`bronze`").collect()
+
+source_entries = dbutils.fs.ls(SOURCE_PATH)
+
+print("=" * 60)
+print("BRONZE TELEMETRY PIPELINE")
+print("=" * 60)
+print(f"Environment      : {env.upper()}")
+print(f"Source           : {SOURCE_PATH}")
+print(f"Schema location  : {SCHEMA_PATH}")
+print(f"Checkpoint       : {CHECKPOINT_PATH}")
+print(f"Target           : {BRONZE_TABLE}")
+print(f"Source entries   : {len(source_entries)}")
+
+if not source_entries:
+    print(
+        "Source directory is empty. "
+        "Initial schema inference requires input JSON files."
     )
 
-print()
-print("Resolved configuration")
-print("-" * 60)
-print(f"Source     : {SOURCE_PATH}")
-print(f"Schema     : {SCHEMA_PATH}")
-print(f"Checkpoint : {CHECKPOINT_PATH}")
-print(f"Target     : {BRONZE_TABLE}")
-print("-" * 60)
-print("Environment isolation check: PASSED")
 
-
-# COMMAND ----------
-# Auto Loader
+# 5. Read JSON files with Auto Loader
 #
-# Business logic remains unchanged from the original pipeline.
+# Preserve the existing schema inference behavior.
 
 bronze_stream = (
-    spark.readStream
-    .format("cloudFiles")
+    spark.readStream.format("cloudFiles")
     .option("cloudFiles.format", "json")
     .option("cloudFiles.schemaLocation", SCHEMA_PATH)
     .load(SOURCE_PATH)
@@ -88,12 +101,13 @@ bronze_stream = (
 )
 
 
-# COMMAND ----------
-# Write Bronze Delta table
+# 6. Write Bronze and wait for completion
+#
+# Exceptions propagate so the Databricks task fails visibly.
 
 query = (
-    bronze_stream.writeStream
-    .format("delta")
+    bronze_stream.writeStream.format("delta")
+    .outputMode("append")
     .option("checkpointLocation", CHECKPOINT_PATH)
     .trigger(availableNow=True)
     .toTable(BRONZE_TABLE)
@@ -102,34 +116,28 @@ query = (
 query.awaitTermination()
 
 
-# COMMAND ----------
-# Validation
+# 7. Verify the output table
 
-bronze_count = spark.table(BRONZE_TABLE).count()
+if not spark.catalog.tableExists(BRONZE_TABLE):
+    raise RuntimeError(f"Bronze table was not created: {BRONZE_TABLE}")
+
+bronze_df = spark.table(BRONZE_TABLE)
+
+if "_ingest_ts" not in bronze_df.columns:
+    raise RuntimeError(f"Missing ingestion timestamp in {BRONZE_TABLE}")
+
+# Suitable for this small learning dataset.
+# Avoid a full-table count on every run at production scale.
+bronze_count = bronze_df.count()
+
+
+# 8. Final status
 
 print()
 print("=" * 60)
-print("BRONZE PIPELINE COMPLETED")
+print("BRONZE PIPELINE: SUCCESS")
 print("=" * 60)
-print(f"Environment : {env.upper()}")
-print(f"Target      : {BRONZE_TABLE}")
-print(f"Bronze rows : {bronze_count}")
-
-display(
-    spark.table(BRONZE_TABLE)
-    .orderBy("event_id")
-)
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT COUNT(*)
-# MAGIC FROM aviation_dev.bronze.telemetry;
-# MAGIC
-# MAGIC SHOW TABLES IN aviation_prod.bronze;
-
-# COMMAND ----------
-
-# MAGIC %sql
-# MAGIC SELECT COUNT(*)
-# MAGIC FROM aviation_prod.bronze.telemetry;
+print(f"Environment       : {env.upper()}")
+print(f"Target            : {BRONZE_TABLE}")
+print(f"Total Bronze rows : {bronze_count}")
+print(f"Checkpoint        : {CHECKPOINT_PATH}")
