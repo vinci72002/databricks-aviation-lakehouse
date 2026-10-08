@@ -1,0 +1,19 @@
+bundle:
+  name: databricks-aviation-lakehouse
+
+include:
+  - resources/*.yml
+
+variables:
+  env:
+    description: Pipeline environment
+    default: dev
+
+targets:
+  dev:
+    default: true
+    workspace:
+      host: https://dbc-0eebcb7a-d44b.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
+    variables:
+      env: dev
