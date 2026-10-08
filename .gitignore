@@ -24,6 +24,9 @@ derby.log
 credentials.json
 secrets.json
 
+# Local learning notes — keep on disk, do not publish
+docs/production/learning/
+
 # OS / editor
 .DS_Store
 Thumbs.db
