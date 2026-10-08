@@ -20,7 +20,7 @@ class TestPipelineConfig(unittest.TestCase):
             with self.subTest(env=env):
                 config = PipelineConfig(env)
                 root = f"/Volumes/aviation_{env}/raw/landing"
-                self.assertEqual(config.catalog, f"aviation_{env}")
+                self.assertEqual(config.catalog, "intentionally_wrong")
                 self.assertEqual(config.raw_volume, root)
                 self.assertEqual(config.telemetry_source_path, f"{root}/telemetry")
                 self.assertEqual(
