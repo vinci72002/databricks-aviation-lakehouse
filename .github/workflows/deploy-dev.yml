@@ -54,7 +54,6 @@ jobs:
           databricks current-user me
           databricks workspace get-status "/Workspace/Users/vinci72001@gmail.com/.bundle/databricks-aviation-lakehouse/dev/state" --output json
           databricks workspace get-status "/Workspace/Users/vinci72001@gmail.com/.bundle/databricks-aviation-lakehouse/dev/state/resources.json" --output json
-          databricks workspace get-status "/Workspace/Users/vinci72001@gmail.com/.bundle/databricks-aviation-lakehouse/dev/state/terraform.tfstate" --output json
 
       - name: Deploy DEV bundle
         run: databricks bundle deploy -t dev
