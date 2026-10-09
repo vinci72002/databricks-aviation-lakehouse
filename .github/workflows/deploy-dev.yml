@@ -1,0 +1,62 @@
+name: Deploy Aviation DEV
+
+on:
+  push:
+    branches:
+      - feature/de-103-ci
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aviation-deploy-dev
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Check and deploy DEV
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      DATABRICKS_AUTH_TYPE: oauth-m2m
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: python -m compileall -q common notebooks/production tests
+
+      - name: Run configuration tests
+        run: python -m unittest discover -s ./tests -t . -p "test_*.py" -v
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+        with:
+          version: "1.11.0"
+
+      - name: Validate DEV bundle
+        run: databricks bundle validate -t dev
+
+      - name: Check deployment state access
+        run: |
+          databricks current-user me
+          databricks workspace get-status "/Workspace/Users/vinci72001@gmail.com/.bundle/databricks-aviation-lakehouse/dev/state" --output json
+          databricks workspace get-status "/Workspace/Users/vinci72001@gmail.com/.bundle/databricks-aviation-lakehouse/dev/state/resources.json" --output json
+
+      - name: Deploy DEV bundle
+        run: databricks bundle deploy -t dev
+
+      - name: Show deployment summary
+        run: databricks bundle summary -t dev

@@ -1,0 +1,31 @@
+name: Databricks Authentication Check
+
+on:
+  push:
+    branches:
+      - feature/de-103-ci
+    paths:
+      - .github/workflows/databricks-auth.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  authentication:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+        with:
+          version: "1.11.0"
+
+      - name: Verify service principal authentication
+        env:
+          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+          DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+          DATABRICKS_AUTH_TYPE: oauth-m2m
+        run: databricks current-user me
