@@ -3,16 +3,11 @@ resources:
     aviation_pipeline:
       name: aviation-lakehouse-${var.env}
       max_concurrent_runs: 1
-      permissions:
-        - user_name: vinci72001@gmail.com
-          level: IS_OWNER
-        - service_principal_name: "33312777-70fd-4c4f-b1c0-342c13512e3c"
-          level: CAN_MANAGE
 
       schedule:
         quartz_cron_expression: "0 0/20 * * * ?"
         timezone_id: Asia/Singapore
-        pause_status: UNPAUSED
+        pause_status: ${var.schedule_status}
 
       tasks:
         - task_key: environment_setup
