@@ -2,7 +2,10 @@ resources:
   jobs:
     aviation_pipeline:
       name: aviation-lakehouse-${var.env}
-
+      
+    permissions:
+            - user_name: vinci72001@gmail.com
+              level: IS_OWNER
       # Prevent overlapping runs that modify the same watermark.
       max_concurrent_runs: 1
 
