@@ -150,11 +150,34 @@ for name, table in TABLE_NAMES.items():
 
 
 # COMMAND ----------
-# 5. Create catalog
+# 5. Ensure catalog
+#
+# CREATE CATALOG requires Metastore privilege CREATE CATALOG.
+# The prod job runs as a service principal, which should not have
+# that privilege. CREATE CATALOG IF NOT EXISTS still checks it,
+# even when the catalog already exists.
+#
+# Create aviation_prod once as a Metastore admin, then grant the
+# service principal USE CATALOG / CREATE SCHEMA on that catalog.
 
-spark.sql(f"CREATE CATALOG IF NOT EXISTS `{catalog}`")
+existing_catalogs = {
+    row["catalog"] if "catalog" in row.asDict() else row[0]
+    for row in spark.sql("SHOW CATALOGS").collect()
+}
 
-print(f"Catalog ready: {catalog}")
+if catalog in existing_catalogs:
+    print(f"Catalog already exists: {catalog}")
+else:
+    try:
+        spark.sql(f"CREATE CATALOG `{catalog}`")
+        print(f"Catalog created: {catalog}")
+    except Exception as exc:
+        raise RuntimeError(
+            f"Catalog {catalog} does not exist and this identity cannot "
+            f"create it on the Metastore. A Metastore admin must run "
+            f"CREATE CATALOG {catalog} and grant this job identity "
+            f"USE CATALOG and CREATE SCHEMA on {catalog}."
+        ) from exc
 
 
 # COMMAND ----------
