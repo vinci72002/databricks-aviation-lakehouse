@@ -150,56 +150,69 @@ for name, table in TABLE_NAMES.items():
 
 
 # COMMAND ----------
-# 5. Ensure catalog
+# 5. Use an existing catalog
 #
-# CREATE CATALOG requires Metastore privilege CREATE CATALOG.
-# The prod job runs as a service principal, which should not have
-# that privilege. CREATE CATALOG IF NOT EXISTS still checks it,
-# even when the catalog already exists.
+# This job runs in prod as service principal aviation-github-deployer.
+# GRANT statements must use the application ID, not the display name:
+#   33312777-70fd-4c4f-b1c0-342c13512e3c
+# That identity must not have Metastore privilege CREATE CATALOG.
+# Do not call CREATE CATALOG / CREATE CATALOG IF NOT EXISTS here:
+# both require that privilege even when the catalog already exists.
 #
-# Create aviation_prod once as a Metastore admin, then grant the
-# service principal USE CATALOG / CREATE SCHEMA on that catalog.
+# A Metastore admin creates aviation_dev / aviation_prod once, then grants:
+#   GRANT USE CATALOG ON CATALOG aviation_prod TO `33312777-70fd-4c4f-b1c0-342c13512e3c`;
+#   GRANT CREATE SCHEMA ON CATALOG aviation_prod TO `33312777-70fd-4c4f-b1c0-342c13512e3c`;
 
-existing_catalogs = {
-    row["catalog"] if "catalog" in row.asDict() else row[0]
-    for row in spark.sql("SHOW CATALOGS").collect()
+try:
+    spark.sql(f"DESCRIBE CATALOG `{catalog}`").collect()
+except Exception as exc:
+    raise RuntimeError(
+        f"Catalog `{catalog}` is missing or this identity cannot use it. "
+        f"Do not grant CREATE CATALOG to the job principal. "
+        f"A Metastore admin must create the catalog and grant "
+        f"USE CATALOG and CREATE SCHEMA on `{catalog}` to "
+        f"`33312777-70fd-4c4f-b1c0-342c13512e3c` "
+        f"(display name aviation-github-deployer)."
+    ) from exc
+
+print(f"Catalog ready: {catalog}")
+
+
+# COMMAND ----------
+# 6. Create missing schemas only
+#
+# CREATE SCHEMA IF NOT EXISTS also checks CREATE SCHEMA even when
+# the schema already exists. Skip SQL when SHOW SCHEMAS already
+# returns the name.
+
+existing_schemas = {
+    str(row[0]) for row in spark.sql(f"SHOW SCHEMAS IN `{catalog}`").collect()
 }
 
-if catalog in existing_catalogs:
-    print(f"Catalog already exists: {catalog}")
-else:
-    try:
-        spark.sql(f"CREATE CATALOG `{catalog}`")
-        print(f"Catalog created: {catalog}")
-    except Exception as exc:
-        raise RuntimeError(
-            f"Catalog {catalog} does not exist and this identity cannot "
-            f"create it on the Metastore. A Metastore admin must run "
-            f"CREATE CATALOG {catalog} and grant this job identity "
-            f"USE CATALOG and CREATE SCHEMA on {catalog}."
-        ) from exc
-
-
-# COMMAND ----------
-# 6. Create schemas
-
 for schema in SCHEMAS:
-    spark.sql(f"CREATE SCHEMA IF NOT EXISTS `{catalog}`.`{schema}`")
+    if schema in existing_schemas:
+        print(f"Schema already exists: {catalog}.{schema}")
+        continue
 
-    print(f"Schema ready: {catalog}.{schema}")
+    spark.sql(f"CREATE SCHEMA `{catalog}`.`{schema}`")
+    print(f"Schema created: {catalog}.{schema}")
 
 
 # COMMAND ----------
-# 7. Create managed landing volume
-#
-# Uses the managed storage configured in Unity Catalog.
+# 7. Create managed landing volume if missing
 
-spark.sql(f"""
-    CREATE VOLUME IF NOT EXISTS
-        `{catalog}`.`raw`.`{VOLUME_NAME}`
-    """)
+existing_volumes = {
+    row["volume_name"]
+    for row in spark.sql(f"SHOW VOLUMES IN `{catalog}`.`raw`").collect()
+}
 
-print(f"Volume ready: {VOLUME_FULL_NAME}")
+if VOLUME_NAME in existing_volumes:
+    print(f"Volume already exists: {VOLUME_FULL_NAME}")
+else:
+    spark.sql(
+        f"CREATE VOLUME `{catalog}`.`raw`.`{VOLUME_NAME}`"
+    )
+    print(f"Volume created: {VOLUME_FULL_NAME}")
 
 
 # COMMAND ----------

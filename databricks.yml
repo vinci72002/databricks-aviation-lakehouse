@@ -42,7 +42,7 @@ targets:
 
     variables:
       env: prod
-      schedule_status: PAUSED
+      schedule_status: UNPAUSED
 
     run_as:
       service_principal_name: "33312777-70fd-4c4f-b1c0-342c13512e3c"
