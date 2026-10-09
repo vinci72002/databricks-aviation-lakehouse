@@ -9,6 +9,11 @@ resources:
         - service_principal_name: "33312777-70fd-4c4f-b1c0-342c13512e3c"
           level: CAN_MANAGE
 
+      schedule:
+        quartz_cron_expression: "0 0/20 * * * ?"
+        timezone_id: Asia/Singapore
+        pause_status: UNPAUSED
+
       tasks:
         - task_key: environment_setup
           notebook_task:
