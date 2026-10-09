@@ -1,0 +1,53 @@
+name: Deploy Aviation PROD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aviation-deploy-prod
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Check and deploy PROD
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_CLIENT_ID: ${{ secrets.DATABRICKS_CLIENT_ID }}
+      DATABRICKS_CLIENT_SECRET: ${{ secrets.DATABRICKS_CLIENT_SECRET }}
+      DATABRICKS_AUTH_TYPE: oauth-m2m
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: python -m compileall -q common notebooks/production tests
+
+      - name: Run configuration tests
+        run: python -m unittest discover -s ./tests -t . -p "test_*.py" -v
+
+      - name: Install Databricks CLI
+        uses: databricks/setup-cli@main
+        with:
+          version: "1.11.0"
+
+      - name: Validate PROD bundle
+        run: databricks bundle validate -t prod
+
+      - name: Deploy PROD bundle
+        run: databricks bundle deploy -t prod
+
+      - name: Show deployment summary
+        run: databricks bundle summary -t prod
